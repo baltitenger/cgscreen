@@ -36,6 +36,8 @@ struct cgscreen_dev {
 	uint8_t buffers[2][URB_BUFSIZE]; // the buffers themselves
 	struct mutex io_mutex;           // only one reader at a time
 	uint8_t disconnected: 1;         // prevent io after disconnect
+	struct v4l2_device v4l2_dev;     // video4linux device
+	struct video_device *vdev;       // video device
 };
 
 static void cgscreen_delete(struct kref *kref) {
@@ -47,29 +49,16 @@ static void cgscreen_delete(struct kref *kref) {
 	kfree(dev);
 }
 
-static int cgscreen_open(struct inode *inode, struct file *file) {
-	int subminor;
-	struct usb_interface *intf;
+static int cgscreen_open(struct file *file) {
 	struct cgscreen_dev *dev;
 
-	subminor = iminor(inode);
-
-	intf = usb_find_interface(&cgscreen_driver, subminor);
-	if (!intf) {
-		pr_err("%s - error, can't find device for minor %d\n", __func__, subminor);
-		return -ENODEV;
-	}
-
-	dev = usb_get_intfdata(intf);
+	dev = video_drvdata(file);
 	if (!dev) {
 		return -ENODEV;
 	}
 
 	// increment our usage count for the device
 	kref_get(&dev->kref);
-
-	// save our object in the file's private structure
-	file->private_data = dev;
 
 	return 0;
 }
@@ -78,10 +67,12 @@ static ssize_t cgscreen_read(struct file *file, char *buffer, size_t count, loff
 	struct cgscreen_dev *dev;
 	int ret;
 
+	return -EFAULT;
+
 	if (!count)
 		return 0;
 
-	dev = file->private_data;
+	dev = video_drvdata(file);
 
 	ret = mutex_lock_interruptible(&dev->io_mutex);
 	if (ret < 0)
@@ -102,10 +93,10 @@ exit:
 	return ret;
 }
 
-static int cgscreen_release(struct inode *inode, struct file *file) {
+static int cgscreen_release(struct file *file) {
 	struct cgscreen_dev *dev;
 
-	dev = file->private_data;
+	dev = video_drvdata(file);
 	if (!dev)
 		return -ENODEV;
 
@@ -115,21 +106,11 @@ static int cgscreen_release(struct inode *inode, struct file *file) {
 	return 0;
 }
 
-static const struct file_operations cgscreen_fops = {
+static const struct v4l2_file_operations cgscreen_fops = {
 	.owner   = THIS_MODULE,
 	.open    = cgscreen_open,
 	.read    = cgscreen_read,
 	.release = cgscreen_release,
-};
-
-/*
- * usb class driver info in order to get a minor number from the usb core,
- * and to have the device registered with the driver core
- */
-static struct usb_class_driver cgscreen_class = {
-	.name = NAME "%d",
-	.fops = &cgscreen_fops,
-	.minor_base = 42,
 };
 
 void cgscreen_recv(struct cgscreen_dev *dev) {
@@ -181,7 +162,7 @@ static int cgscreen_probe(struct usb_interface *intf, const struct usb_device_id
 	struct cgscreen_dev *dev;
 	struct usb_endpoint_descriptor *bulk_in;
 	int ret;
-	
+
 	dev = kzalloc(sizeof(*dev), GFP_KERNEL);
 	if (!dev)
 		return -ENOMEM;
@@ -206,48 +187,72 @@ static int cgscreen_probe(struct usb_interface *intf, const struct usb_device_id
 		goto error;
 	}
 
+	dev->vdev = video_device_alloc();
+	if (!dev->vdev) {
+		ret = -ENOMEM;
+		goto error;
+	}
+	dev->vdev->v4l2_dev = &dev->v4l2_dev;
+	if (dev->udev->product)
+		strscpy(dev->vdev->name, dev->udev->product, sizeof(dev->vdev->name));
+	else
+		snprintf(dev->vdev->name, sizeof(dev->vdev->name),
+			 "Casio calculator capture (%04x:%04x)",
+			 le16_to_cpu(dev->udev->descriptor.idVendor),
+			 le16_to_cpu(dev->udev->descriptor.idProduct));
+	dev->vdev->fops         = &cgscreen_fops;
+	// dev->vdev->ioctl_ops    = &cgscreen_ioctl_ops;
+	dev->vdev->release      = video_device_release;
+	dev->vdev->device_caps  = V4L2_CAP_DEVICE_CAPS | V4L2_CAP_VIDEO_CAPTURE;
+	video_set_drvdata(dev->vdev, dev);
+
 	// save our data pointer in this interface device
 	usb_set_intfdata(intf, dev);
 
 	// we can register the device now, as it is ready
-	ret = usb_register_dev(intf, &cgscreen_class);
+	ret = v4l2_device_register(&intf->dev, &dev->v4l2_dev);
 	if (ret) {
-		// something prevented us from registering this driver
-		dev_err(&intf->dev, "Unable to get a minor for this device.\n");
+		dev_err(&intf->dev, "Unable to register v4l2 device.\n");
 		usb_set_intfdata(intf, NULL);
 		goto error;
 	}
 
-	dev_info(&intf->dev,
-			"Casio graphing device now attached to cgscreen%d", intf->minor);
+	ret = video_register_device(dev->vdev, VFL_TYPE_VIDEO, -1);
+	if (ret) {
+		dev_err(&intf->dev, "Unable to register video device.\n");
+		goto unregister;
+	}
 
 	usb_fill_bulk_urb(dev->urb, dev->udev,
 			usb_rcvbulkpipe(dev->udev, dev->bulk_in_endp),
 			dev->urb_buf, URB_BUFSIZE,
 			cgscreen_read_bulk_callback, dev);
-
 	ret = usb_submit_urb(dev->urb, GFP_KERNEL);
 	if (ret) {
-		dev_err(&intf->dev,
-			"Failed submitting read urb, error %d\n", ret);
-		return ret;
+		dev_err(&intf->dev, "Failed submitting read urb, error %d\n", ret);
+		goto unregister;
 	}
+
+	dev_info(&intf->dev, "Casio graphing device now attached.");
 
 	return 0;
 
+unregister:
+	video_unregister_device(dev->vdev);
+	v4l2_device_unregister(&dev->v4l2_dev);
 error:
+	cgscreen_delete(&dev->kref);
 	return ret;
 }
 
 static void cgscreen_disconnect(struct usb_interface *intf) {
 	struct cgscreen_dev *dev;
-	int minor = intf->minor;
 
 	dev = usb_get_intfdata(intf);
 	usb_set_intfdata(intf, NULL);
 
-	// give back our minor
-	usb_deregister_dev(intf, &cgscreen_class);
+	video_unregister_device(dev->vdev);
+	v4l2_device_unregister(&dev->v4l2_dev);
 
 	// prevent more I/O from starting
 	mutex_lock(&dev->io_mutex);
@@ -259,8 +264,7 @@ static void cgscreen_disconnect(struct usb_interface *intf) {
 	// decrement our usage count
 	kref_put(&dev->kref, cgscreen_delete);
 
-	dev_info(&intf->dev,
-			"Casio graphing device cgscreen%d now disconnected", minor);
+	dev_info(&intf->dev, "Casio graphing device disconnected");
 }
 
 static struct usb_driver cgscreen_driver = {
