@@ -14,15 +14,15 @@
 #define NAME "cgscreen"
 #define WIDTH 128
 #define HEIGHT 64
-#define SCREEN_SIZE (WIDTH*HEIGHT/8ul)
+#define SCREEN_SIZE (WIDTH * HEIGHT / 8ul)
 #define URB_BUFSIZE (6 + SCREEN_SIZE + 2)
-#define VIDEO_SIZE (SCREEN_SIZE*8)
+#define VIDEO_SIZE (SCREEN_SIZE * 8)
 #define BUFC 2
 #define FOURCC V4L2_PIX_FMT_GREY
 
 MODULE_LICENSE("GPL");
 MODULE_AUTHOR("Baltazár Radics");
-MODULE_DESCRIPTION("Casio graphing calculator screen projector usb driver");
+MODULE_DESCRIPTION("Casio graphing calculator screen projector USB driver");
 MODULE_VERSION("0.1.0");
 
 static const struct usb_device_id cgscreen_id_table[] = {
@@ -30,8 +30,6 @@ static const struct usb_device_id cgscreen_id_table[] = {
 	{ }
 };
 MODULE_DEVICE_TABLE(usb, cgscreen_id_table);
-
-static struct usb_driver cgscreen_driver;
 
 struct cgscreen_dev {
 	struct kref kref;
@@ -47,7 +45,7 @@ struct cgscreen_dev {
 	uint8_t buffers[2][URB_BUFSIZE]; // the buffers themselves
 	struct v4l2_device v4l2_dev;     // video4linux device
 	struct video_device *vdev;       // video device
-	uint8_t stream_on: 1;            // whether streaming (and the urb) is running
+	uint8_t stream_on : 1;           // whether streaming (and the urb) is running
 };
 
 static void cgscreen_delete_dev(struct kref *kref) {
@@ -67,10 +65,12 @@ typedef uint8_t videobuf_t[VIDEO_SIZE];
 
 struct cgscreen_opener {
 	uint32_t read_seq;       // sequence number of last read buffer
-	int bufcount;            // the number of video buffers in use
+	uint32_t bufcount;       // the number of video buffers in use
 	videobuf_t *buffers;     // video buffers used for streaming
 	uint32_t bufinfo[BUFC];  // videobuf flags
 	wait_queue_head_t queue; // woken up when a new buffer is added, locked during buffer access
+	uint32_t period_ms;      // time between successive frames (in milliseconds)
+	ktime_t read_timestamp;  // when the last buffer was read
 };
 
 static void cgscreen_delete_opener(struct cgscreen_opener *opener) {
@@ -84,20 +84,20 @@ static void cgscreen_delete_opener(struct cgscreen_opener *opener) {
 static void cgscreen_vm_open(struct vm_area_struct *vma) {
 	struct cgscreen_opener *opener = vma->vm_private_data;
 	spin_lock(&opener->queue.lock);
-	opener->bufinfo[vma->vm_pgoff / (VIDEO_SIZE>>PAGE_SHIFT)] |= V4L2_BUF_FLAG_MAPPED;
+	opener->bufinfo[vma->vm_pgoff / (VIDEO_SIZE >> PAGE_SHIFT)] |= V4L2_BUF_FLAG_MAPPED;
 	spin_unlock(&opener->queue.lock);
 }
 
 static void cgscreen_vm_close(struct vm_area_struct *vma) {
 	struct cgscreen_opener *opener = vma->vm_private_data;
 	spin_lock(&opener->queue.lock);
-	opener->bufinfo[vma->vm_pgoff / (VIDEO_SIZE>>PAGE_SHIFT)] &= ~V4L2_BUF_FLAG_MAPPED;
+	opener->bufinfo[vma->vm_pgoff / (VIDEO_SIZE >> PAGE_SHIFT)] &= ~V4L2_BUF_FLAG_MAPPED;
 	spin_unlock(&opener->queue.lock);
 }
 
 static struct vm_operations_struct cgscreen_vmops = {
-	.open  = cgscreen_vm_open,
-	.close = cgscreen_vm_close,
+		.open = cgscreen_vm_open,
+		.close = cgscreen_vm_close,
 };
 
 static int cgscreen_open(struct file *file) {
@@ -114,6 +114,7 @@ static int cgscreen_open(struct file *file) {
 		return -ENOMEM;
 	}
 	init_waitqueue_head(&opener->queue);
+	opener->period_ms = 33; // default: ~30fps
 
 	// increment our usage count for the device
 	kref_get(&dev->kref);
@@ -136,14 +137,14 @@ static int cgscreen_release(struct file *file) {
 	return 0;
 }
 
-static unsigned int cgscreen_poll(struct file *file, struct poll_table_struct *pts) {
+static __poll_t cgscreen_poll(struct file *file, struct poll_table_struct *pts) {
 	struct cgscreen_opener *opener = file->private_data;
 	struct cgscreen_dev *dev = video_drvdata(file);
 	int done_seq, read_seq;
 
-	spin_lock(&dev->queue.lock);
+	spin_lock_irq(&dev->queue.lock);
 	done_seq = dev->done_seq;
-	spin_unlock(&dev->queue.lock);
+	spin_unlock_irq(&dev->queue.lock);
 
 	spin_lock(&opener->queue.lock);
 	read_seq = opener->read_seq;
@@ -151,22 +152,23 @@ static unsigned int cgscreen_poll(struct file *file, struct poll_table_struct *p
 
 	if (read_seq < done_seq)
 		return POLLIN | POLLRDNORM;
-	else
-		return 0;
+
+	return 0;
 }
 
 static int cgscreen_mmap(struct file *file, struct vm_area_struct *vma) {
 	struct cgscreen_opener *opener = file->private_data;
-	unsigned long start, bufnr;
+	unsigned long start;
+	unsigned bufnr;
 	void *addr;
 
 	if (!opener)
 		return -ENODEV;
 	if (vma->vm_end - vma->vm_start > VIDEO_SIZE)
 		return -EINVAL;
-	if (vma->vm_pgoff % (VIDEO_SIZE>>PAGE_SHIFT) != 0)
+	if (vma->vm_pgoff % (VIDEO_SIZE >> PAGE_SHIFT) != 0)
 		return -EINVAL;
-	bufnr = vma->vm_pgoff / (VIDEO_SIZE>>PAGE_SHIFT);
+	bufnr = vma->vm_pgoff / (VIDEO_SIZE >> PAGE_SHIFT);
 	if (bufnr >= opener->bufcount)
 		return -EINVAL;
 
@@ -178,7 +180,7 @@ static int cgscreen_mmap(struct file *file, struct vm_area_struct *vma) {
 		if (vm_insert_page(vma, start, page) < 0)
 			return -EAGAIN;
 		start += PAGE_SIZE;
-		addr  += PAGE_SIZE;
+		addr += PAGE_SIZE;
 	}
 
 	vma->vm_private_data = opener;
@@ -189,20 +191,21 @@ static int cgscreen_mmap(struct file *file, struct vm_area_struct *vma) {
 }
 
 static const struct v4l2_file_operations cgscreen_fops = {
-	.owner   = THIS_MODULE,
-	.open    = cgscreen_open,
-	.release = cgscreen_release,
-	.poll    = cgscreen_poll,
-	.mmap    = cgscreen_mmap,
-	.unlocked_ioctl = video_ioctl2,
+		.owner = THIS_MODULE,
+		.open = cgscreen_open,
+		.release = cgscreen_release,
+		.poll = cgscreen_poll,
+		.mmap = cgscreen_mmap,
+		.unlocked_ioctl = video_ioctl2,
 };
 
-void render(uint8_t *src, uint8_t *dst) {
-	uint8_t *end;
+static void render(const uint8_t *src, uint8_t *dst) {
+	const uint8_t *end;
 	int i;
 	for (end = src + SCREEN_SIZE; src < end; ++src)
-		for (i = 0; i < 8; ++i, ++dst)
-			*dst = (*src & 1<<(7-i)) ? 0xff : 0;
+		for (i = 0; i < 8; ++i, ++dst) {
+			*dst = (*src & 1 << (7 - i)) ? 0xff : 0;
+		}
 }
 
 static int vidioc_querycap(struct file *file, void *priv, struct v4l2_capability *cap) {
@@ -292,9 +295,11 @@ static int vidioc_reqbufs(struct file *file, void *fh, struct v4l2_requestbuffer
 	spin_lock(&opener->queue.lock);
 
 	if (b->count > 0) {
-		opener->buffers = vmalloc(VIDEO_SIZE*BUFC);
-		if (!opener->buffers)
+		opener->buffers = vmalloc(VIDEO_SIZE * BUFC);
+		if (!opener->buffers) {
+			spin_unlock(&opener->queue.lock);
 			return -ENOMEM;
+		}
 		memset32(opener->bufinfo, V4L2_BUF_FLAG_PREPARED | V4L2_BUF_FLAG_TIMESTAMP_MONOTONIC, BUFC);
 		opener->bufcount = b->count = BUFC;
 	} else {
@@ -321,8 +326,10 @@ static int vidioc_querybuf(struct file *file, void *fh, struct v4l2_buffer *b) {
 
 	spin_lock(&opener->queue.lock);
 
-	if (b->index > opener->bufcount)
+	if (b->index > opener->bufcount) {
+		spin_unlock(&opener->queue.lock);
 		return -EINVAL;
+	}
 
 	b->bytesused = VIDEO_SIZE;
 	b->flags = opener->bufinfo[b->index];
@@ -350,8 +357,10 @@ static int vidioc_qbuf(struct file *file, void *fh, struct v4l2_buffer *b) {
 
 	spin_lock(&opener->queue.lock);
 
-	if (!(opener->bufinfo[b->index] & V4L2_BUF_FLAG_PREPARED))
+	if (!(opener->bufinfo[b->index] & V4L2_BUF_FLAG_PREPARED)) {
+		spin_unlock(&opener->queue.lock);
 		return -EINVAL;
+	}
 
 	b->flags = opener->bufinfo[b->index] ^= V4L2_BUF_FLAG_PREPARED | V4L2_BUF_FLAG_QUEUED;
 
@@ -361,7 +370,7 @@ static int vidioc_qbuf(struct file *file, void *fh, struct v4l2_buffer *b) {
 	return 0;
 }
 
-static int findbuf(struct cgscreen_opener *opener) {
+static int findbuf(struct cgscreen_opener *opener) __must_hold(opener->queue.lock) {
 	int i;
 	for (i = 0; i < BUFC; ++i)
 		if (opener->bufinfo[i] & V4L2_BUF_FLAG_QUEUED)
@@ -369,67 +378,90 @@ static int findbuf(struct cgscreen_opener *opener) {
 	return i;
 }
 
+static int waitbuf(struct cgscreen_opener *opener, bool nonblock) __must_hold(opener->queue.lock) {
+	int buf = findbuf(opener);
+	if (buf != BUFC)
+		return buf;
+	if (nonblock)
+		return -EAGAIN;
+	if (wait_event_interruptible_locked(opener->queue, ((buf = findbuf(opener)) != BUFC)))
+		return -EINTR;
+	return buf;
+}
+
+// static int waitseq(struct cgscreen_dev *dev, int seq, bool nonblock) __must_hold(dev->queue.lock)
+// { 	if (dev->done_seq > seq) 		return dev->done_seq; 	if (nonblock) 		return -EAGAIN; 	if
+//(wait_event_interruptible_locked(dev->queue, (dev->done_seq > seq))) 		return -EINTR; 	return
+//dev->done_seq;
+//}
+
+static ktime_t waitframe(ktime_t last, int64_t period_ms, bool nonblock) {
+	ktime_t now = ktime_get();
+	int64_t delay = ktime_to_ms(last - now) + period_ms;
+	if (delay < 0)
+		return now;
+	if (nonblock)
+		return -EAGAIN;
+	if (msleep_interruptible(delay) < (uint64_t)delay)
+		return -EINTR;
+	return ktime_get();
+}
+
 // dequeue a filled buffer
 static int vidioc_dqbuf(struct file *file, void *fh, struct v4l2_buffer *b) {
 	struct cgscreen_dev *dev = video_drvdata(file);
 	struct cgscreen_opener *opener = file->private_data;
 	int seq, buf;
+	ktime_t timestamp;
+	const bool nonblock = file->f_flags & O_NONBLOCK;
 
 	if (!dev || !opener)
 		return -ENODEV;
 	if (b->type != V4L2_BUF_TYPE_VIDEO_CAPTURE)
 		return -EINVAL;
 
-
 	spin_lock(&opener->queue.lock);
-	seq = opener->read_seq;
+	buf = waitbuf(opener, nonblock);
+	if (buf < 0) {
+		spin_unlock(&opener->queue.lock);
+		return buf;
+	}
+	opener->bufinfo[buf] &= ~V4L2_BUF_FLAG_QUEUED;
+	// seq = opener->read_seq;
+	timestamp = opener->read_timestamp;
 	spin_unlock(&opener->queue.lock);
 
-	spin_lock(&dev->queue.lock);
-	if (dev->done_seq <= seq) {
-		if (file->f_flags & O_NONBLOCK) {
-			spin_unlock(&dev->queue.lock);
-			return -EAGAIN;
-		}
-		if (wait_event_interruptible_locked(dev->queue, (dev->done_seq > seq))) {
-			spin_unlock(&dev->queue.lock);
-			return -EINTR;
-		}
+	timestamp = waitframe(timestamp, opener->period_ms, nonblock);
+	if (timestamp < 0) {
+		opener->bufinfo[buf] |= V4L2_BUF_FLAG_QUEUED;
+		return timestamp;
 	}
-	spin_unlock(&dev->queue.lock);
+
+	spin_lock_irq(&dev->queue.lock);
+	// seq = waitseq(dev, seq, nonblock);
+	// if (seq < 0) {
+	//	spin_unlock_irq(&dev->queue.lock);
+	//	opener->bufinfo[buf] |= V4L2_BUF_FLAG_QUEUED;
+	//	return seq;
+	//}
+	seq = dev->done_seq;
+	render(dev->done_buf + 6, opener->buffers[buf]);
+	spin_unlock_irq(&dev->queue.lock);
 
 	spin_lock(&opener->queue.lock);
-	buf = findbuf(opener);
-	if (buf == BUFC) { // no queued buffers
-		if (file->f_flags & O_NONBLOCK) {
-			spin_unlock(&opener->queue.lock);
-			return -EAGAIN;
-		}
-		if (wait_event_interruptible_locked(opener->queue, ((buf = findbuf(opener)) != BUFC))) {
-			spin_unlock(&opener->queue.lock);
-			return -EINTR;
-		}
-	}
-
-	// FIXME this can probably cause a deadlock (not sure tho but it's definitely bad practice)
-	spin_lock(&dev->queue.lock);
-	render(dev->done_buf + 6, opener->buffers[buf]);
-	opener->bufinfo[buf] ^= V4L2_BUF_FLAG_PREPARED | V4L2_BUF_FLAG_QUEUED;
-	opener->read_seq = dev->done_seq;
-
+	opener->bufinfo[buf] |= V4L2_BUF_FLAG_PREPARED;
+	opener->read_seq = seq;
 	b->index = buf;
 	b->bytesused = VIDEO_SIZE;
 	b->flags = opener->bufinfo[buf];
 	b->field = V4L2_FIELD_NONE;
-	b->timestamp.tv_usec = dev->done_timestamp / 1000 % 1000000;
-	b->timestamp.tv_sec  = dev->done_timestamp / 1000 / 1000000;
+	b->timestamp.tv_usec = timestamp / 1000 % 1000000;
+	b->timestamp.tv_sec = timestamp / 1000 / 1000000;
 	b->sequence = opener->read_seq;
 	b->memory = V4L2_MEMORY_MMAP;
-	b->m.offset = (VIDEO_SIZE>>PAGE_SHIFT) * b->index;
+	b->m.offset = (VIDEO_SIZE >> PAGE_SHIFT) * b->index;
 	b->length = VIDEO_SIZE;
 	b->reserved = b->reserved2 = 0;
-
-	spin_unlock(&dev->queue.lock);
 	spin_unlock(&opener->queue.lock);
 
 	return 0;
@@ -447,21 +479,68 @@ static int vidioc_streamoff(struct file *file, void *fh, enum v4l2_buf_type type
 	return 0;
 }
 
+static int vidioc_g_parm(struct file *file, void *fh, struct v4l2_streamparm *a) {
+	struct cgscreen_opener *opener = file->private_data;
+
+	if (a->type != V4L2_BUF_TYPE_VIDEO_CAPTURE)
+		return -EINVAL;
+
+	spin_lock(&opener->queue.lock);
+
+	a->parm.capture.capability = V4L2_CAP_TIMEPERFRAME;
+	a->parm.capture.capturemode = 0;
+	a->parm.capture.timeperframe.numerator = opener->period_ms;
+	a->parm.capture.timeperframe.denominator = 1000;
+	a->parm.capture.extendedmode = 0;
+	a->parm.capture.readbuffers = 0;
+	memset(a->parm.capture.reserved, 0, sizeof(a->parm.capture.reserved));
+
+	spin_unlock(&opener->queue.lock);
+
+	return 0;
+}
+
+static int vidioc_s_parm(struct file *file, void *fh, struct v4l2_streamparm *a) {
+	struct cgscreen_opener *opener = file->private_data;
+
+	if (a->type != V4L2_BUF_TYPE_VIDEO_CAPTURE)
+		return -EINVAL;
+
+	spin_lock(&opener->queue.lock);
+
+	a->parm.capture.capability = V4L2_CAP_TIMEPERFRAME;
+	a->parm.capture.capturemode = 0;
+	if (a->parm.capture.timeperframe.denominator != 0)
+		opener->period_ms =
+				1000 * a->parm.capture.timeperframe.numerator / a->parm.capture.timeperframe.denominator;
+	a->parm.capture.timeperframe.numerator = opener->period_ms;
+	a->parm.capture.timeperframe.denominator = 1000;
+	a->parm.capture.extendedmode = 0;
+	a->parm.capture.readbuffers = 0;
+	memset(a->parm.capture.reserved, 0, sizeof(a->parm.capture.reserved));
+
+	spin_unlock(&opener->queue.lock);
+
+	return 0;
+}
+
 static const struct v4l2_ioctl_ops cgscreen_ioctl_ops = {
-	.vidioc_querycap         = vidioc_querycap,
-	.vidioc_enum_fmt_vid_cap = vidioc_enum_fmt_vid_cap,
-	.vidioc_g_fmt_vid_cap    = vidioc_g_fmt_vid_cap,
-	.vidioc_s_fmt_vid_cap    = vidioc_g_fmt_vid_cap,
-	.vidioc_try_fmt_vid_cap  = vidioc_g_fmt_vid_cap,
-	.vidioc_enum_input       = vidioc_enum_input,
-	.vidioc_g_input          = vidioc_g_input,
-	.vidioc_s_input          = vidioc_s_input,
-	.vidioc_reqbufs          = vidioc_reqbufs,
-	.vidioc_querybuf         = vidioc_querybuf,
-	.vidioc_qbuf             = vidioc_qbuf,
-	.vidioc_dqbuf            = vidioc_dqbuf,
-	.vidioc_streamon         = vidioc_streamon,
-	.vidioc_streamoff        = vidioc_streamoff,
+		.vidioc_querycap = vidioc_querycap,
+		.vidioc_enum_fmt_vid_cap = vidioc_enum_fmt_vid_cap,
+		.vidioc_g_fmt_vid_cap = vidioc_g_fmt_vid_cap,
+		.vidioc_s_fmt_vid_cap = vidioc_g_fmt_vid_cap,
+		.vidioc_try_fmt_vid_cap = vidioc_g_fmt_vid_cap,
+		.vidioc_enum_input = vidioc_enum_input,
+		.vidioc_g_input = vidioc_g_input,
+		.vidioc_s_input = vidioc_s_input,
+		.vidioc_reqbufs = vidioc_reqbufs,
+		.vidioc_querybuf = vidioc_querybuf,
+		.vidioc_qbuf = vidioc_qbuf,
+		.vidioc_dqbuf = vidioc_dqbuf,
+		.vidioc_streamon = vidioc_streamon,
+		.vidioc_streamoff = vidioc_streamoff,
+		.vidioc_g_parm = vidioc_g_parm,
+		.vidioc_s_parm = vidioc_s_parm,
 };
 
 static void cgscreen_recv(struct cgscreen_dev *dev) {
@@ -469,47 +548,48 @@ static void cgscreen_recv(struct cgscreen_dev *dev) {
 	uint8_t sum = 0;
 	unsigned i;
 	char *tmp;
+	unsigned long flags;
 
 	for (i = 1; i < URB_BUFSIZE - 2; ++i) {
 		sum += dev->urb_buf[i];
 	}
-	sum += (dev->urb_buf[i] <= '9' ? dev->urb_buf[i] - '0' : dev->urb_buf[i] + 10 - 'A') << 4
-		| (dev->urb_buf[i+1] <= '9' ? dev->urb_buf[i+1] - '0' : dev->urb_buf[i+1] + 10 - 'A');
+	sum += (dev->urb_buf[i] <= '9' ? dev->urb_buf[i] - '0' : dev->urb_buf[i] + 10 - 'A') << 4 |
+				 (dev->urb_buf[i + 1] <= '9' ? dev->urb_buf[i + 1] - '0' : dev->urb_buf[i + 1] + 10 - 'A');
 
 	if (sum) {
 		dev_info(&intf->dev, "Invalid checksum: %hhu", sum);
 		return;
 	}
 
-	spin_lock(&dev->queue.lock);
+	spin_lock_irqsave(&dev->queue.lock, flags);
 	tmp = dev->urb_buf;
 	dev->urb_buf = dev->done_buf;
 	dev->done_buf = tmp;
-	++dev->done_seq;
+	i = ++dev->done_seq;
 	dev->done_timestamp = ktime_get();
-	spin_unlock(&dev->queue.lock);
-	wake_up_all_locked(&dev->queue);
+	spin_unlock_irqrestore(&dev->queue.lock, flags);
+	// wake_up_all_locked(&dev->queue);
 	dev->urb->transfer_buffer = dev->urb_buf;
 }
 
 static void cgscreen_read_bulk_callback(struct urb *urb) {
 	struct cgscreen_dev *dev = urb->context;
 	struct usb_interface *intf = dev->intf;
-	if (urb->status == -EOVERFLOW)
-		dev_info(&intf->dev, "Got overflow, ignoring"); // seems to happen when screen updates a lot
-	else if (urb->status == -EPROTO)
-		return; // don't continue, device shutting down
-	else if (urb->status == -ECONNRESET)
-		return; // don't continue, the urb was canceled
+	if (urb->status == -EOVERFLOW) // seems to happen when screen updates a lot
+		dev_info(&intf->dev, "Got overflow, ignoring");
+	else if (urb->status == -EPROTO ||   // don't continue, device shutting down
+	         urb->status == -ECONNRESET) // don't continue, the urb was canceled
+		return;
 	else if (urb->status)
 		dev_info(&intf->dev, "Read error %d", urb->status);
-	else if (urb->actual_length == 0) {} // ignore null reads
+	else if (urb->actual_length == 0) // ignore null reads
+		;
 	else if (urb->actual_length != URB_BUFSIZE)
 		dev_info(&intf->dev, "Got partial frame, ignoring");
 	else if (dev->urb_buf[0] != 0x0b)
 		dev_info(&intf->dev, "Got non-image packet type, ignoring");
-	else if (memcmp(dev->urb_buf+1, "TYP01", 5))
-		dev_info(&intf->dev, "Git unknown screen type, ignoring");
+	else if (memcmp(dev->urb_buf + 1, "TYP01", 5) != 0)
+		dev_info(&intf->dev, "Got unknown screen type, ignoring");
 	else
 		cgscreen_recv(dev);
 	usb_submit_urb(urb, GFP_KERNEL);
@@ -527,13 +607,12 @@ static int cgscreen_probe(struct usb_interface *intf, const struct usb_device_id
 	kref_init(&dev->kref);
 	dev->udev = usb_get_dev(interface_to_usbdev(intf));
 	dev->intf = usb_get_intf(intf);
-	dev->urb_buf  = dev->buffers[0];
+	dev->urb_buf = dev->buffers[0];
 	dev->done_buf = dev->buffers[1];
 	init_waitqueue_head(&dev->queue);
 
 	// set up the endpoint information
-	ret = usb_find_common_endpoints(intf->cur_altsetting,
-			&bulk_in, NULL, NULL, NULL);
+	ret = usb_find_common_endpoints(intf->cur_altsetting, &bulk_in, NULL, NULL, NULL);
 	if (ret) {
 		dev_err(&intf->dev, "Could not find bulk-in endpoint\n");
 		goto error;
@@ -554,15 +633,14 @@ static int cgscreen_probe(struct usb_interface *intf, const struct usb_device_id
 	if (dev->udev->product)
 		strscpy(dev->vdev->name, dev->udev->product, sizeof(dev->vdev->name));
 	else
-		snprintf(dev->vdev->name, sizeof(dev->vdev->name),
-			 "Casio calculator capture (%04x:%04x)",
-			 le16_to_cpu(dev->udev->descriptor.idVendor),
-			 le16_to_cpu(dev->udev->descriptor.idProduct));
-	dev->vdev->fops         = &cgscreen_fops;
-	dev->vdev->ioctl_ops    = &cgscreen_ioctl_ops;
-	dev->vdev->release      = video_device_release;
-	dev->vdev->device_caps  = V4L2_CAP_VIDEO_CAPTURE | V4L2_CAP_STREAMING;
-	// dev->vdev->dev_debug    |= V4L2_DEV_DEBUG_FOP | V4L2_DEV_DEBUG_IOCTL | V4L2_DEV_DEBUG_IOCTL_ARG;
+		snprintf(dev->vdev->name, sizeof(dev->vdev->name), "Casio calculator capture (%04x:%04x)",
+		         le16_to_cpu(dev->udev->descriptor.idVendor),
+		         le16_to_cpu(dev->udev->descriptor.idProduct));
+	dev->vdev->fops = &cgscreen_fops;
+	dev->vdev->ioctl_ops = &cgscreen_ioctl_ops;
+	dev->vdev->release = video_device_release;
+	dev->vdev->device_caps = V4L2_CAP_VIDEO_CAPTURE | V4L2_CAP_STREAMING;
+	//dev->vdev->dev_debug |= V4L2_DEV_DEBUG_FOP | V4L2_DEV_DEBUG_IOCTL | V4L2_DEV_DEBUG_IOCTL_ARG;
 	video_set_drvdata(dev->vdev, dev);
 
 	// save our data pointer in this interface device
@@ -582,13 +660,11 @@ static int cgscreen_probe(struct usb_interface *intf, const struct usb_device_id
 		goto unregister;
 	}
 
-	usb_fill_bulk_urb(dev->urb, dev->udev,
-			usb_rcvbulkpipe(dev->udev, dev->bulk_in_endp),
-			dev->urb_buf, URB_BUFSIZE,
-			cgscreen_read_bulk_callback, dev);
+	usb_fill_bulk_urb(dev->urb, dev->udev, usb_rcvbulkpipe(dev->udev, dev->bulk_in_endp),
+	                  dev->urb_buf, URB_BUFSIZE, cgscreen_read_bulk_callback, dev);
 	ret = usb_submit_urb(dev->urb, GFP_KERNEL);
 	if (ret) {
-		dev_err(&intf->dev, "Failed submitting read urb, error %d\n", ret);
+		dev_err(&intf->dev, "Failed submitting read URB, error %d\n", ret);
 		goto unregister;
 	}
 
@@ -622,11 +698,10 @@ static void cgscreen_disconnect(struct usb_interface *intf) {
 }
 
 static struct usb_driver cgscreen_driver = {
-	.name       = NAME,
-	.probe      = cgscreen_probe,
-	.disconnect = cgscreen_disconnect,
-	.id_table = cgscreen_id_table,
+		.name = NAME,
+		.probe = cgscreen_probe,
+		.disconnect = cgscreen_disconnect,
+		.id_table = cgscreen_id_table,
 };
 
 module_usb_driver(cgscreen_driver);
-

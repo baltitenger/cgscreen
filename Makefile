@@ -1,4 +1,6 @@
 obj-m += cgscreen.o
+KCFLAGS = -Wall -Wextra -Wno-unused-parameter
+export KCFLAGS
 all:
 	make -C /usr/src/linux M=$(PWD) modules
 clean:
