@@ -14,11 +14,15 @@
 #define NAME "cgscreen"
 #define WIDTH 128
 #define HEIGHT 64
-#define SCREEN_SIZE (WIDTH * HEIGHT / 8ul)
-#define URB_BUFSIZE (6 + SCREEN_SIZE + 2)
+#define SCREEN_SIZE (WIDTH * HEIGHT / 8UL)
+#define URB_RX (6 + SCREEN_SIZE + 2)
+#define URB_BLOCKSIZE (512)
+#define URB_BUFSIZE (((URB_RX - 1) / URB_BLOCKSIZE + 1) * URB_BLOCKSIZE)
 #define VIDEO_SIZE (SCREEN_SIZE * 8)
 #define BUFC 2
 #define FOURCC V4L2_PIX_FMT_GREY
+
+#define hextoint(hexchar) ((hexchar) <= '9' ? (hexchar) - '0' : (hexchar) + 10 - 'A')
 
 MODULE_LICENSE("GPL");
 MODULE_AUTHOR("Baltazár Radics");
@@ -26,9 +30,8 @@ MODULE_DESCRIPTION("Casio graphing calculator screen projector USB driver");
 MODULE_VERSION("0.1.0");
 
 static const struct usb_device_id cgscreen_id_table[] = {
-	{ USB_DEVICE(0x07cf, 0x6101) }, // A caiso calculator in 'Projector' mode
-	{ }
-};
+		{USB_DEVICE(0x07cf, 0x6101)}, // A caiso calculator in 'Projector' mode
+		{}};
 MODULE_DEVICE_TABLE(usb, cgscreen_id_table);
 
 struct cgscreen_dev {
@@ -39,7 +42,8 @@ struct cgscreen_dev {
 	uint8_t bulk_in_endp;            // the endpoint pipe for reading
 	uint8_t *urb_buf;                // the buffer to receive data
 	uint8_t *done_buf;               // a complete frame
-	uint32_t done_seq;               // sequence number of done_buf
+	uint32_t done_off;               // where the data starts in done_buf
+	uint64_t done_seq;               // sequence number of done_buf
 	ktime_t done_timestamp;          // when the last buffer was read
 	wait_queue_head_t queue;         // woken up after successful read, locked during buffer swap
 	uint8_t buffers[2][URB_BUFSIZE]; // the buffers themselves
@@ -199,13 +203,17 @@ static const struct v4l2_file_operations cgscreen_fops = {
 		.unlocked_ioctl = video_ioctl2,
 };
 
-static void render(const uint8_t *src, uint8_t *dst) {
-	const uint8_t *end;
-	int i;
-	for (end = src + SCREEN_SIZE; src < end; ++src)
-		for (i = 0; i < 8; ++i, ++dst) {
-			*dst = (*src & 1 << (7 - i)) ? 0xff : 0;
-		}
+static void render01(const uint8_t *src, uint32_t off, uint8_t *dst) {
+	const uint8_t *p, *end;
+	uint32_t i;
+	p = src + ((off + 6) % URB_BUFSIZE);
+	end = src + ((off + 6 + SCREEN_SIZE) % URB_BUFSIZE);
+	while (p != end) {
+		for (i = 0; i < 8; ++i, ++dst)
+			*dst = (*p & 1 << (7 - i)) ? 0xff : 0;
+		if (++p == src + URB_BUFSIZE)
+			p = src;
+	}
 }
 
 static int vidioc_querycap(struct file *file, void *priv, struct v4l2_capability *cap) {
@@ -389,10 +397,14 @@ static int waitbuf(struct cgscreen_opener *opener, bool nonblock) __must_hold(op
 	return buf;
 }
 
-// static int waitseq(struct cgscreen_dev *dev, int seq, bool nonblock) __must_hold(dev->queue.lock)
-// { 	if (dev->done_seq > seq) 		return dev->done_seq; 	if (nonblock) 		return -EAGAIN; 	if
-//(wait_event_interruptible_locked(dev->queue, (dev->done_seq > seq))) 		return -EINTR; 	return
-//dev->done_seq;
+//static int waitseq(struct cgscreen_dev *dev, uint64_t seq, bool nonblock) __must_hold(dev->queue.lock) {
+//	if (dev->done_seq > seq)
+//		return dev->done_seq;
+//	if (nonblock)
+//		return -EAGAIN;
+//	if (wait_event_interruptible_locked(dev->queue, (dev->done_seq > seq)))
+//		return -EINTR;
+//	return dev->done_seq;
 //}
 
 static ktime_t waitframe(ktime_t last, int64_t period_ms, bool nonblock) {
@@ -439,13 +451,13 @@ static int vidioc_dqbuf(struct file *file, void *fh, struct v4l2_buffer *b) {
 
 	spin_lock_irq(&dev->queue.lock);
 	// seq = waitseq(dev, seq, nonblock);
-	// if (seq < 0) {
+	//if (seq < 0) {
 	//	spin_unlock_irq(&dev->queue.lock);
 	//	opener->bufinfo[buf] |= V4L2_BUF_FLAG_QUEUED;
 	//	return seq;
 	//}
 	seq = dev->done_seq;
-	render(dev->done_buf + 6, opener->buffers[buf]);
+	render01(dev->done_buf, dev->done_off, opener->buffers[buf]);
 	spin_unlock_irq(&dev->queue.lock);
 
 	spin_lock(&opener->queue.lock);
@@ -543,18 +555,23 @@ static const struct v4l2_ioctl_ops cgscreen_ioctl_ops = {
 		.vidioc_s_parm = vidioc_s_parm,
 };
 
-static void cgscreen_recv(struct cgscreen_dev *dev) {
+// receive a TYP01 screen
+static void cgscreen_recv01(struct cgscreen_dev *dev, uint32_t off) {
 	struct usb_interface *intf = dev->intf;
 	uint8_t sum = 0;
-	unsigned i;
-	char *tmp;
+	const uint8_t *p, *end;
+	uint8_t *tmp;
 	unsigned long flags;
 
-	for (i = 1; i < URB_BUFSIZE - 2; ++i) {
-		sum += dev->urb_buf[i];
+	p = dev->urb_buf + ((off + 1) % URB_BUFSIZE);
+	end = dev->urb_buf + ((off + URB_RX - 2) % URB_BUFSIZE);
+	while (p != end) {
+		sum += *p;
+		if (++p == dev->urb_buf + URB_BUFSIZE)
+			p = dev->urb_buf;
 	}
-	sum += (dev->urb_buf[i] <= '9' ? dev->urb_buf[i] - '0' : dev->urb_buf[i] + 10 - 'A') << 4 |
-				 (dev->urb_buf[i + 1] <= '9' ? dev->urb_buf[i + 1] - '0' : dev->urb_buf[i + 1] + 10 - 'A');
+	sum += hextoint(dev->urb_buf[(off + URB_RX - 2) % URB_BUFSIZE]) << 4 |
+	       hextoint(dev->urb_buf[(off + URB_RX - 1) % URB_BUFSIZE]);
 
 	if (sum) {
 		dev_info(&intf->dev, "Invalid checksum: %hhu", sum);
@@ -565,7 +582,8 @@ static void cgscreen_recv(struct cgscreen_dev *dev) {
 	tmp = dev->urb_buf;
 	dev->urb_buf = dev->done_buf;
 	dev->done_buf = tmp;
-	i = ++dev->done_seq;
+	dev->done_off = off;
+	++dev->done_seq;
 	dev->done_timestamp = ktime_get();
 	spin_unlock_irqrestore(&dev->queue.lock, flags);
 	// wake_up_all_locked(&dev->queue);
@@ -574,24 +592,29 @@ static void cgscreen_recv(struct cgscreen_dev *dev) {
 
 static void cgscreen_read_bulk_callback(struct urb *urb) {
 	struct cgscreen_dev *dev = urb->context;
-	struct usb_interface *intf = dev->intf;
-	if (urb->status == -EOVERFLOW) // seems to happen when screen updates a lot
-		dev_info(&intf->dev, "Got overflow, ignoring");
-	else if (urb->status == -EPROTO ||   // don't continue, device shutting down
-	         urb->status == -ECONNRESET) // don't continue, the urb was canceled
+	struct device *logdev = &dev->intf->dev;
+	if (urb->status == -ESHUTDOWN || // device shutting down
+	    urb->status == -EPROTO ||    // device shutting down
+	    urb->status == -ECONNRESET)  // the urb was canceled
 		return;
-	else if (urb->status)
-		dev_info(&intf->dev, "Read error %d", urb->status);
-	else if (urb->actual_length == 0) // ignore null reads
+	if (urb->status)
+		dev_info(logdev, "Read error %d", urb->status);
+	else if (urb->actual_length == 0 ||         // ignore null reads
+	         urb->actual_length == URB_BUFSIZE) // continue reading
 		;
-	else if (urb->actual_length != URB_BUFSIZE)
-		dev_info(&intf->dev, "Got partial frame, ignoring");
-	else if (dev->urb_buf[0] != 0x0b)
-		dev_info(&intf->dev, "Got non-image packet type, ignoring");
-	else if (memcmp(dev->urb_buf + 1, "TYP01", 5) != 0)
-		dev_info(&intf->dev, "Got unknown screen type, ignoring");
-	else
-		cgscreen_recv(dev);
+	else {
+		uint32_t off = (urb->actual_length - URB_RX + URB_BUFSIZE) % URB_BUFSIZE;
+		char type[6]; // packet type:1, screen type:5
+		uint32_t i;
+		for (i = 0; i < sizeof type; ++i)
+			type[i] = dev->urb_buf[(off + i) % URB_BUFSIZE];
+		if (type[0] != 0x0b)
+			dev_info(logdev, "Got non-image packet type, ignoring");
+		else if (memcmp(type + 1, "TYP01", sizeof type - 1) == 0)
+			cgscreen_recv01(dev, off);
+		else
+			dev_info(logdev, "Got unknown screen type, ignoring");
+	}
 	usb_submit_urb(urb, GFP_KERNEL);
 }
 
