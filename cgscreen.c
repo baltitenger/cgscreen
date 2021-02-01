@@ -210,7 +210,7 @@ static void render01(const uint8_t *src, uint32_t off, uint8_t *dst) {
 	end = src + ((off + 6 + SCREEN_SIZE) % URB_BUFSIZE);
 	while (p != end) {
 		for (i = 0; i < 8; ++i, ++dst)
-			*dst = (*p & 1 << (7 - i)) ? 0xff : 0;
+			*dst = (*p & 1 << (7 - i)) ? 0x00 : 0xff;
 		if (++p == src + URB_BUFSIZE)
 			p = src;
 	}
