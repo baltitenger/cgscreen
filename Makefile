@@ -1,10 +1,11 @@
-obj-m += cgscreen.o
-KCFLAGS = -Wall -Wextra -Wno-unused-parameter
-export KCFLAGS
+ifneq ($(KERNELRELEASE),)
+obj-m  := casio4l.o
+else
+KDIR ?= /lib/modules/`uname -r`/build
+
 all:
-	make -C /usr/src/linux M=$(PWD) modules
+	$(MAKE) -C $(KDIR) M=$$PWD
 clean:
-	make -C /usr/src/linux M=$(PWD) clean
-re: all
-	sudo rmmod cgscreen
-	sudo insmod cgscreen.ko
+	$(MAKE) -C $(KDIR) M=$$PWD clean
+endif
+

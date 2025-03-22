@@ -3,10 +3,10 @@
 #include <linux/kernel.h>
 #include <linux/kref.h>
 #include <linux/module.h>
-#include <linux/slab.h>
 #include <linux/time.h>
 #include <linux/usb.h>
 #include <linux/version.h>
+#include <linux/vmalloc.h>
 #include <media/v4l2-dev.h>
 #include <media/v4l2-device.h>
 #include <media/v4l2-ioctl.h>
@@ -222,8 +222,8 @@ static int vidioc_querycap(struct file *file, void *priv, struct v4l2_capability
 	if (!dev)
 		return -ENODEV;
 
-	strlcpy(cap->driver, "cgscreen", sizeof(cap->driver));
-	strlcpy(cap->card, dev->vdev->name, sizeof(cap->card));
+	strscpy(cap->driver, "cgscreen");
+	strscpy(cap->card, dev->vdev->name);
 	usb_make_path(dev->udev, cap->bus_info, sizeof(cap->bus_info));
 	cap->version = LINUX_VERSION_CODE;
 	cap->capabilities = dev->vdev->device_caps | V4L2_CAP_DEVICE_CAPS;
@@ -239,7 +239,7 @@ static int vidioc_enum_fmt_vid_cap(struct file *file, void *fh, struct v4l2_fmtd
 	if (f->index) // we have only one format
 		return -EINVAL;
 
-	strlcpy(f->description, "8 bpp, Greyscale (GREY)", sizeof(f->description));
+	strscpy(f->description, "8 bpp, Greyscale (GREY)");
 	f->pixelformat = FOURCC;
 	f->flags = 0;
 
@@ -267,7 +267,7 @@ static int vidioc_enum_input(struct file *file, void *fh, struct v4l2_input *inp
 	if (inp->index != 0)
 		return -EINVAL;
 
-	strlcpy(inp->name, "Screen", sizeof(inp->name));
+	strscpy(inp->name, "Screen");
 	inp->type = V4L2_INPUT_TYPE_CAMERA;
 	inp->audioset = 0;
 	inp->tuner = 0;
@@ -654,7 +654,7 @@ static int cgscreen_probe(struct usb_interface *intf, const struct usb_device_id
 	}
 	dev->vdev->v4l2_dev = &dev->v4l2_dev;
 	if (dev->udev->product)
-		strscpy(dev->vdev->name, dev->udev->product, sizeof(dev->vdev->name));
+		strscpy(dev->vdev->name, dev->udev->product);
 	else
 		snprintf(dev->vdev->name, sizeof(dev->vdev->name), "Casio calculator capture (%04x:%04x)",
 		         le16_to_cpu(dev->udev->descriptor.idVendor),
