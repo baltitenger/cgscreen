@@ -1,3 +1,4 @@
+#include "linux/minmax.h"
 #include <linux/container_of.h>
 #include <linux/dev_printk.h>
 #include <linux/fs.h>
@@ -31,10 +32,10 @@ MODULE_VERSION("0.1.0");
 #define HEIGHT 64
 #define SCREEN_SIZE (WIDTH * HEIGHT / 8UL)
 #define URB_RX (6 + SCREEN_SIZE + 2)
-#define URB_BLOCKSIZE 512
-#define URB_BUFSIZE round_up(URB_RX, URB_BLOCKSIZE)
+#define URB_BUFSIZE 2048
 #define VIDEO_SIZE (SCREEN_SIZE * 8)
 #define FOURCC V4L2_PIX_FMT_GREY
+#define SYNC_BYTE 0x0b
 
 #define hextoint(hexchar) ((hexchar) <= '9' ? (hexchar) - '0' : (hexchar) + 10 - 'A')
 
@@ -63,6 +64,8 @@ struct casio4l {
 	bool run:1;
 	bool running:1;
 	u8 urb_buf[URB_BUFSIZE];
+	unsigned recvd;
+	u8 recv_buf[URB_RX];
 };
 
 static void casio4l_release(struct kref *kref) {
@@ -198,42 +201,30 @@ static const struct v4l2_ioctl_ops casio4l_ioctl_ops = {
 	.vidioc_remove_bufs = vb2_ioctl_remove_bufs,
 };
 
-static void render01(const uint8_t *src, uint32_t off, uint8_t *dst) {
-	const uint8_t *p, *end;
-	uint32_t i;
-	p = src + ((off + 6) % URB_BUFSIZE);
-	end = src + ((off + 6 + SCREEN_SIZE) % URB_BUFSIZE);
-	while (p != end) {
-		for (i = 0; i < 8; ++i, ++dst)
-			*dst = (*p & 1 << (7 - i)) ? 0x00 : 0xff;
-		if (++p == src + URB_BUFSIZE)
-			p = src;
+static void render01(uint8_t *dst, const uint8_t *src) {
+	for (int i = 0; i < SCREEN_SIZE; ++i) {
+		for (int b = 0x80; b; ++dst, b >>= 1)
+			*dst = (src[i] & b) ? 0x00 : 0xff;
 	}
 }
 
 // receive a TYP01 screen
-static void casio4l_recv01(struct casio4l *dev, uint32_t off) {
+static void casio4l_recv01(struct casio4l *dev) {
 	struct device *logdev = &dev->intf->dev;
 	uint8_t sum = 0;
-	const uint8_t *p, *end;
 	unsigned long flags;
 
-	p = dev->urb_buf + ((off + 1) % URB_BUFSIZE);
-	end = dev->urb_buf + ((off + URB_RX - 2) % URB_BUFSIZE);
-	while (p != end) {
-		sum += *p;
-		if (++p == dev->urb_buf + URB_BUFSIZE)
-			p = dev->urb_buf;
-	}
-	sum += hextoint(dev->urb_buf[(off + URB_RX - 2) % URB_BUFSIZE]) << 4 |
-	       hextoint(dev->urb_buf[(off + URB_RX - 1) % URB_BUFSIZE]);
+	for (int i = 1; i < URB_RX - 2; ++i)
+		sum += dev->recv_buf[i];
+	sum += hextoint(dev->recv_buf[URB_RX - 2]) << 4 |
+	       hextoint(dev->recv_buf[URB_RX - 1]);
 
 	if (sum) {
 		dev_info(logdev, "Invalid checksum: %hhu", sum);
 		return;
 	}
 
-	dev_info(logdev, "got valid typ01 frame");
+	// dev_info(logdev, "got valid typ01 frame");
 
 	spin_lock_irqsave(&dev->irqlock, flags);
 	if (list_empty(&dev->bufs)) {
@@ -245,12 +236,17 @@ static void casio4l_recv01(struct casio4l *dev, uint32_t off) {
 	list_del(&buf->list);
 	spin_unlock_irqrestore(&dev->irqlock, flags);
 
-	render01(dev->urb_buf, off, vb2_plane_vaddr(&buf->vb.vb2_buf, 0));
+	render01(vb2_plane_vaddr(&buf->vb.vb2_buf, 0), dev->recv_buf+6);
 	vb2_set_plane_payload(&buf->vb.vb2_buf, 0, VIDEO_SIZE);
 	buf->vb.vb2_buf.timestamp = ktime_get_ns();
 	buf->vb.field = V4L2_FIELD_NONE;
 	buf->vb.sequence = dev->seqnr++;
 	vb2_buffer_done(&buf->vb.vb2_buf, VB2_BUF_STATE_DONE);
+}
+
+static void packet_done(struct casio4l *dev) {
+	if (memcmp(dev->recv_buf + 1, "TYP01", 5) == 0)
+		casio4l_recv01(dev);
 }
 
 static void casio4l_urb_complete(struct urb *urb) {
@@ -264,25 +260,28 @@ static void casio4l_urb_complete(struct urb *urb) {
 		dev_info(logdev, "Read error %d", urb->status);
 		goto resubmit;
 	}
-	dev_info(logdev, "got %i bytes", urb->actual_length);
+	// dev_info(logdev, "got %i bytes", urb->actual_length);
 
 	// print_hex_dump_bytes("casio4l ", DUMP_PREFIX_OFFSET, dev->urb_buf, urb->actual_length);
 
-	if (urb->actual_length == 0 ||         // ignore null reads
-			urb->actual_length == URB_BUFSIZE) // continue reading
-		goto resubmit;
+	if (urb->actual_length == 0)
+		packet_done(dev);
 
-	uint32_t off = (urb->actual_length - URB_RX + URB_BUFSIZE) % URB_BUFSIZE;
-	char hdr[6];
-	uint32_t i;
-	for (i = 0; i < sizeof hdr; ++i)
-		hdr[i] = dev->urb_buf[(off + i) % URB_BUFSIZE];
-	if (hdr[0] != 0x0b)
-		dev_info(logdev, "Got non-image packet type, ignoring");
-	else if (memcmp(hdr + 1, "TYP01", sizeof hdr - 1) == 0)
-		casio4l_recv01(dev, off);
-	else
-		dev_info(logdev, "Got unknown screen type, ignoring");
+	for (unsigned i = 0; i < urb->actual_length; ) {
+		if (dev->recvd == 0 && dev->urb_buf[i] != SYNC_BYTE) {
+			++i;
+			continue;
+		}
+		unsigned rx = min(URB_BUFSIZE - i, URB_RX - dev->recvd);
+		memcpy(dev->recv_buf + dev->recvd, dev->urb_buf + i, rx);
+		dev->recvd += rx;
+		i += rx;
+		if (dev->recvd == URB_RX) {
+			packet_done(dev);
+			dev->recvd = 0;
+		}
+	}
+
 resubmit:
 	if (dev->run)
 		usb_submit_urb(urb, GFP_KERNEL);
@@ -316,6 +315,7 @@ static int casio4l_start_streaming(struct vb2_queue *q, unsigned int count) {
 
 	spin_lock_irqsave(&dev->irqlock, flags);
 
+	dev->seqnr = 0;
 	if (!dev->running)
 		ret = usb_submit_urb(dev->urb, GFP_KERNEL);
 	if (ret == 0)
