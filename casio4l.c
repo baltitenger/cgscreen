@@ -1,4 +1,3 @@
-#include "linux/minmax.h"
 #include <linux/container_of.h>
 #include <linux/dev_printk.h>
 #include <linux/fs.h>
@@ -6,6 +5,7 @@
 #include <linux/kernel.h>
 #include <linux/kref.h>
 #include <linux/list.h>
+#include <linux/minmax.h>
 #include <linux/module.h>
 #include <linux/slab.h>
 #include <linux/spinlock.h>
@@ -45,7 +45,7 @@ MODULE_VERSION("0.1.0");
 typedef uint8_t u8;
 
 struct casio4l_buf {
-	struct vb2_v4l2_buffer vb;
+	struct vb2_v4l2_buffer vb; // has to be first
 	struct list_head list;
 };
 
@@ -98,7 +98,7 @@ static int casio4l_vidioc_querycap(struct file *file, void *priv, struct v4l2_ca
 	if (!dev)
 		return -ENODEV;
 
-	strscpy(cap->driver, "casio4l");
+	strscpy(cap->driver, KBUILD_MODNAME);
 	strscpy(cap->card, dev->vdev.name);
 	usb_make_path(dev->udev, cap->bus_info, sizeof(cap->bus_info));
 	cap->version = LINUX_VERSION_CODE;
@@ -148,8 +148,7 @@ static int casio4l_vidioc_enum_fmt_vid_cap(struct file *file, void *fh, struct v
 }
 
 static int casio4l_vidioc_g_fmt_vid_cap(struct file *file, void *priv, struct v4l2_format *fmt) {
-	if (fmt->type != V4L2_BUF_TYPE_VIDEO_CAPTURE)
-		return -EINVAL;
+
 	fmt->fmt.pix.width = WIDTH;
 	fmt->fmt.pix.height = HEIGHT;
 	fmt->fmt.pix.pixelformat = FOURCC;
@@ -161,6 +160,7 @@ static int casio4l_vidioc_g_fmt_vid_cap(struct file *file, void *priv, struct v4
 	fmt->fmt.pix.ycbcr_enc = V4L2_YCBCR_ENC_DEFAULT;
 	fmt->fmt.pix.quantization = V4L2_QUANTIZATION_DEFAULT;
 	fmt->fmt.pix.xfer_func = V4L2_XFER_FUNC_DEFAULT;
+
 	return 0;
 }
 
@@ -414,6 +414,8 @@ static int casio4l_probe(struct usb_interface *intf, const struct usb_device_id 
 		goto error;
 
 	usb_fill_bulk_urb(dev->urb, dev->udev, usb_rcvbulkpipe(dev->udev, bulk_in->bEndpointAddress), dev->urb_buf, URB_BUFSIZE, casio4l_urb_complete, dev);
+
+	dev_info(&intf->dev, "New calculator attached!");
 
 	return 0;
 
