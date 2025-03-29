@@ -100,6 +100,8 @@ with the USB device through the same API they use with regular files: `open`,
 systems.) The behavior of these system calls is defined by the module's `struct
 file_operations`.
 
+[eiaf]: https://en.wikipedia.org/wiki/Everything_is_a_file
+
 We could do the same, but then we'd still need to write an user-space program to
 talk to this special device and presumably display the received screen contents.
 However, Linux already has an API for streaming video data: `v4l2`
@@ -117,9 +119,48 @@ like `/dev/video0` (and also uses the `video4linux` subsystem's *major number*).
 
 As for any other character device, we need to provide a `file_operations`
 structure to specialize the behavior of various system calls on our module's
-devices.
+devices. `V4l2` provides its own `struct v4l2_file_operations`, which is a subset
+of the generic `struct file_operations` which only includes the calls needed for
+`v4l2` devices. It also has `video_ioctl2()`, which can be used for the
+`unlocked_ioctl` field of fops, and uses a separate `struct v4l2_ioctl_ops` to
+handle all the `v4l2` specific `ioctl` calls. It also handles all the common
+logic and validation of these `ioctl`s so drivers have less to worry about.
+
+These `ioctl`s are the primary way for users-space to interact with the devices,
+allowing apps to query and change many of their properties, including inputs,
+outputs, pixel formats, frame intervals, controls. The `v4l2` framework supports
+many different modes of operation, so drivers typically only implement a subset
+of these `ioctl`s (e.g. we only have video capture, so we won't have anything
+output or audio related). The `VIDIOC_QUERYCAP` `ioctl` is used to communicate
+what is and what isn't supported.
+
+Once the parameters are negotiated successfully, apps can start streaming
+frames. `V4l2` defines two main ways of doing this: by using `read()` (or
+`write()` in case of outputs, called `READWRITE`), or by exchanging
+memory-mapped buffers (called `STREAMING`). The former is the simplest method,
+but the latter can be more flexible in certain situations. The `STREAMING` API
+allows exchanging meta-information about the buffers, like timestamps. In case
+the driver supports DMA (Direct Memory Access), it may also be more efficient,
+since it doesn't require an extra copy between kernel and user space.
+
+While drivers technically only need to implement one of the methods, supporting
+more can allow a wider range of clients to work with our device. Normally this
+would require quite a lot of boilerplate code: `READWRITE` needs `read()` and
+`poll()`, `STREAMING` needs `mmap()`, `poll()`, and 5-6 extra `ioctl`s depending
+on what method they support for buffer allocation. Since this would have to be
+done in many drivers, the kernel developers came up with a common abstraction:
+the `videobuf2` API.
+
+Drivers using this API only need to implement a few callbacks in `struct
+vb2_ops`, set up a `vb2_queue` object, and they can use the helpers provided by
+`videobuf2` in place of the `file_operations` and `ioctl_ops` callbacks. This
+mechanism also allows drivers to use a different lock for streaming `ioctl`s.
+
+The `v4l-utils` project also provides a tool called `v4l2-compliance`, which can
+check whether a driver behaves in accordance to the spec. It tests almost all
+`ioctl`s and all streaming methods. This can be very useful when developing
+a `v4l2` driver, as it can test many more code paths than any single client.
 
 [kbuild]: https://docs.kernel.org/kbuild/modules.html#shared-makefile
 [v4l2-core]: https://docs.kernel.org/driver-api/media/v4l2-core.html
 [v4l2-user]: https://docs.kernel.org/userspace-api/media/v4l/user-func.html
-[eiaf]: https://en.wikipedia.org/wiki/Everything_is_a_file
