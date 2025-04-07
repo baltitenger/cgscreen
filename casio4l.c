@@ -2,6 +2,7 @@
 #include <linux/dev_printk.h>
 #include <linux/fs.h>
 #include <linux/init.h>
+#include <linux/jiffies.h>
 #include <linux/kernel.h>
 #include <linux/kref.h>
 #include <linux/list.h>
@@ -11,6 +12,8 @@
 #include <linux/spinlock.h>
 #include <linux/string.h>
 #include <linux/time.h>
+#include <linux/timer.h>
+#include <linux/timer_types.h>
 #include <linux/usb.h>
 #include <linux/version.h>
 #include <linux/videodev2.h>
@@ -37,12 +40,35 @@ MODULE_VERSION("0.1.0");
 #define FOURCC V4L2_PIX_FMT_GREY
 #define SYNC_BYTE 0x0b
 
+static_assert(URB_RX <= URB_BUFSIZE);
+
+#define UMS_TAG "CA4L"
+
 #define hextoint(hexchar) ((hexchar) <= '9' ? (hexchar) - '0' : (hexchar) + 10 - 'A')
 
 #define to_casio4l_buf(buf) \
 	container_of(buf, struct casio4l_buf, vb)
 
 typedef uint8_t u8;
+
+enum casio4l_prot {
+	C4LP_BULK,
+	C4LP_UMS,
+};
+
+enum casio4l_state {
+	C4LS_STOPPED,
+	// bulk mode:
+	C4LS_B_RUN,
+	// ums mode:
+	C4LS_U_C1_CSW,
+	C4LS_U_DELAY,
+	C4LS_U_C0_CBW,
+	C4LS_U_C0_RECV,
+	C4LS_U_C0_CSW,
+	C4LS_U_C1_CBW,
+	C4LS_U_C1_RECV,
+};
 
 struct casio4l_buf {
 	struct vb2_v4l2_buffer vb; // has to be first
@@ -59,10 +85,13 @@ struct casio4l {
 	struct vb2_queue queue;
 	struct list_head bufs; // struct casio4l_buf
 	struct mutex lock;
+	struct timer_list timer;
 	spinlock_t irqlock;
 	unsigned seqnr;
+	unsigned rcvbulkpipe, sndbulkpipe;
+	enum casio4l_prot prot;
+	enum casio4l_state state;
 	bool run:1;
-	bool running:1;
 	u8 urb_buf[URB_BUFSIZE];
 	unsigned recvd;
 	u8 recv_buf[URB_RX];
@@ -249,25 +278,95 @@ static void packet_done(struct casio4l *dev) {
 		casio4l_recv01(dev);
 }
 
-static void casio4l_urb_complete(struct urb *urb) {
-	struct casio4l *dev = urb->context;
-	struct device *logdev = &dev->intf->dev;
-	if (urb->status == -ESHUTDOWN || // device shutting down
-	    urb->status == -EPROTO ||    // device shutting down
-	    urb->status == -ECONNRESET)  // the urb was canceled
-		return;
-	if (urb->status) {
-		dev_info(logdev, "Read error %d", urb->status);
-		goto resubmit;
+static void casio4l_fill_ums_cbw(struct casio4l *dev, u32 len, u8 cmd) {
+	dev->urb->pipe = dev->sndbulkpipe;
+	dev->urb->transfer_buffer_length = 31;
+
+	memset(dev->urb_buf, 0, 31);
+	memcpy(dev->urb_buf, "USBC" UMS_TAG, 8);
+	dev->urb_buf[8]  = (len >> 0)  & 0xFF;
+	dev->urb_buf[9]  = (len >> 8)  & 0xFF;
+	dev->urb_buf[10] = (len >> 16) & 0xFF;
+	dev->urb_buf[11] = (len >> 24) & 0xFF;
+	dev->urb_buf[12] = 0x80; // is input
+	dev->urb_buf[14] = 16; // command size
+	dev->urb_buf[15] = cmd;
+	if (cmd == 0xc1) {
+		dev->urb_buf[21] = (len >> 8) & 0xFF;
+		dev->urb_buf[22] = (len >> 0) & 0xFF;
 	}
-	// dev_info(logdev, "got %i bytes", urb->actual_length);
+}
 
-	// print_hex_dump_bytes("casio4l ", DUMP_PREFIX_OFFSET, dev->urb_buf, urb->actual_length);
+static void casio4l_fill_ums_recv(struct casio4l *dev, u32 len) {
+	dev->urb->pipe = dev->rcvbulkpipe;
+	dev->urb->transfer_buffer_length = len;
+}
 
-	if (urb->actual_length == 0)
+static void casio4l_fill_ums_csw(struct casio4l *dev) {
+	dev->urb->pipe = dev->rcvbulkpipe;
+	dev->urb->transfer_buffer_length = 13;
+}
+
+// expects spinlock to be held
+static int casio4l_cont(struct casio4l *dev) {
+	if (!dev->run) switch (dev->state) {
+	case C4LS_STOPPED:
+	case C4LS_B_RUN:
+	case C4LS_U_C0_CBW:
+	case C4LS_U_C1_CBW:
+		dev->state = C4LS_STOPPED;
+		return 0;
+	default:
+		break;
+	}
+
+	if (dev->state == C4LS_STOPPED)
+		dev->state = dev->prot == C4LP_BULK ? C4LS_B_RUN : C4LS_U_C0_CBW;
+
+	switch (dev->state) {
+	case C4LS_STOPPED:
+		return 1;
+
+	case C4LS_B_RUN:
+		break;
+
+	case C4LS_U_C0_CBW:
+		casio4l_fill_ums_cbw(dev, 16, 0xC0);
+		break;
+	case C4LS_U_C0_RECV:
+		casio4l_fill_ums_recv(dev, 16);
+		break;
+	case C4LS_U_C0_CSW:
+		casio4l_fill_ums_csw(dev);
+		break;
+	case C4LS_U_C1_CBW:
+		casio4l_fill_ums_cbw(dev, URB_RX, 0xC1);
+		break;
+	case C4LS_U_C1_RECV:
+		casio4l_fill_ums_recv(dev, URB_RX);
+		break;
+	case C4LS_U_C1_CSW:
+		casio4l_fill_ums_csw(dev);
+		break;
+
+	case C4LS_U_DELAY:
+		dev->timer.expires = get_jiffies_64() + msecs_to_jiffies(10);
+		add_timer(&dev->timer);
+		return 0;
+	}
+
+	int ret = usb_submit_urb(dev->urb, GFP_KERNEL);
+	if (ret)
+		dev->state = C4LS_STOPPED;
+
+	return ret;
+}
+
+static void casio4l_bulk_done(struct casio4l *dev) {
+	if (dev->urb->actual_length == 0)
 		packet_done(dev);
 
-	for (unsigned i = 0; i < urb->actual_length; ) {
+	for (unsigned i = 0; i < dev->urb->actual_length; ) {
 		if (dev->recvd == 0 && dev->urb_buf[i] != SYNC_BYTE) {
 			++i;
 			continue;
@@ -281,12 +380,76 @@ static void casio4l_urb_complete(struct urb *urb) {
 			dev->recvd = 0;
 		}
 	}
+}
 
-resubmit:
-	if (dev->run)
-		usb_submit_urb(urb, GFP_KERNEL);
-	else
-		dev->running = false;
+static void casio4l_ums_done(struct casio4l *dev) {
+	memcpy(dev->recv_buf, dev->urb_buf, URB_RX);
+	packet_done(dev);
+}
+
+static void casio4l_chk_csw(struct casio4l *dev) {
+	if (memcmp(dev->urb_buf, "USBS" UMS_TAG, 8)) {
+		dev_err(&dev->intf->dev, "invalid csw");
+		dev->run = false;
+	}
+}
+
+static void casio4l_done(struct casio4l *dev) {
+	int avail;
+	switch (dev->state) {
+	case C4LS_STOPPED:
+		break;
+	case C4LS_B_RUN:
+		casio4l_bulk_done(dev);
+		break;
+	case C4LS_U_C0_CBW:
+	case C4LS_U_C1_CBW:
+	case C4LS_U_DELAY:
+		++dev->state;
+		break;
+	case C4LS_U_C0_RECV:
+		avail = (dev->urb_buf[6] << 8) | dev->urb_buf[7];
+		if (avail < SCREEN_SIZE)
+			dev->state = C4LS_U_C1_CSW;
+		else
+			dev->state = C4LS_U_C0_CSW;
+		break;
+	case C4LS_U_C0_CSW:
+	case C4LS_U_C1_CSW:
+		++dev->state;
+		casio4l_chk_csw(dev);
+		break;
+	case C4LS_U_C1_RECV:
+		casio4l_ums_done(dev);
+		dev->state = C4LS_U_C1_CSW;
+		break;
+	};
+
+	casio4l_cont(dev);
+}
+
+static void casio4l_timerfn(struct timer_list *timer) {
+	struct casio4l *dev = container_of(timer, struct casio4l, timer);
+	casio4l_done(dev);
+}
+
+static void casio4l_urb_complete(struct urb *urb) {
+	struct casio4l *dev = urb->context;
+	struct device *logdev = &dev->intf->dev;
+	if (urb->status == -ESHUTDOWN || // device shutting down
+	    urb->status == -EPROTO ||    // device shutting down
+	    urb->status == -ECONNRESET)  // the urb was canceled
+		return;
+	if (urb->status) {
+		dev_info(logdev, "Xfer error %d", urb->status);
+		dev->state = C4LS_STOPPED; // TODO recover from errors?
+		return;
+	}
+
+	// dev_info(logdev, "got %i bytes", urb->actual_length);
+	// print_hex_dump_bytes("casio4l ", DUMP_PREFIX_OFFSET, dev->urb_buf, urb->actual_length);
+
+	casio4l_done(dev);
 }
 
 static int casio4l_queue_setup(struct vb2_queue *q,
@@ -316,11 +479,10 @@ static int casio4l_start_streaming(struct vb2_queue *q, unsigned int count) {
 	spin_lock_irqsave(&dev->irqlock, flags);
 
 	dev->seqnr = 0;
-	if (!dev->running)
-		ret = usb_submit_urb(dev->urb, GFP_KERNEL);
-	if (ret == 0)
-		dev->running = dev->run = true;
-	else
+	dev->run = true;
+	if (dev->state == C4LS_STOPPED)
+		ret = casio4l_cont(dev);
+	if (ret)
 		casio4l_return_bufs(dev, VB2_BUF_STATE_QUEUED);
 
 	spin_unlock_irqrestore(&dev->irqlock, flags);
@@ -358,8 +520,8 @@ struct vb2_ops casio4l_qops = {
 static int casio4l_probe(struct usb_interface *intf, const struct usb_device_id *id) {
 	int ret;
 
-	struct usb_endpoint_descriptor *bulk_in;
-	ret = usb_find_common_endpoints(intf->cur_altsetting, &bulk_in, NULL, NULL, NULL);
+	struct usb_endpoint_descriptor *bulk_in, *bulk_out;
+	ret = usb_find_common_endpoints(intf->cur_altsetting, &bulk_in, &bulk_out, NULL, NULL);
 	if (ret)
 		return ret;
 
@@ -372,6 +534,18 @@ static int casio4l_probe(struct usb_interface *intf, const struct usb_device_id 
 	mutex_init(&dev->lock);
 	spin_lock_init(&dev->irqlock);
 	INIT_LIST_HEAD(&dev->bufs);
+	dev->rcvbulkpipe = usb_rcvbulkpipe(dev->udev, bulk_in->bEndpointAddress);
+	dev->sndbulkpipe = usb_sndbulkpipe(dev->udev, bulk_out->bEndpointAddress);
+	switch (id->idProduct) {
+	case 0x6101:
+		dev->prot = C4LP_BULK;
+		break;
+	case 0x6102:
+		dev->prot = C4LP_UMS;
+		// usb_set_interface(intf->usb_dev);
+		break;
+	}
+	dev->timer.function = casio4l_timerfn;
 
 	usb_set_intfdata(intf, dev);
 
@@ -380,6 +554,7 @@ static int casio4l_probe(struct usb_interface *intf, const struct usb_device_id 
 		ret = -ENOMEM;
 		goto error;
 	}
+	usb_fill_bulk_urb(dev->urb, dev->udev, dev->rcvbulkpipe, dev->urb_buf, URB_BUFSIZE, casio4l_urb_complete, dev);
 
 	struct vb2_queue *queue = &dev->queue;
 	queue->type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
@@ -413,8 +588,6 @@ static int casio4l_probe(struct usb_interface *intf, const struct usb_device_id 
 	if (ret)
 		goto error;
 
-	usb_fill_bulk_urb(dev->urb, dev->udev, usb_rcvbulkpipe(dev->udev, bulk_in->bEndpointAddress), dev->urb_buf, URB_BUFSIZE, casio4l_urb_complete, dev);
-
 	dev_info(&intf->dev, "New calculator attached!");
 
 	return 0;
@@ -437,6 +610,7 @@ static void casio4l_disconnect(struct usb_interface *intf) {
 
 static const struct usb_device_id casio4l_id_table[] = {
 		{USB_DEVICE(0x07cf, 0x6101)}, // A caiso calculator in 'Projector' mode
+		{USB_DEVICE_INTERFACE_CLASS(0x07cf, 0x6102, USB_CLASS_MASS_STORAGE)}, // A caiso calculator in 'ScreenRecv' mode
 		{}};
 MODULE_DEVICE_TABLE(usb, casio4l_id_table);
 
