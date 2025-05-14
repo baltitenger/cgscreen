@@ -122,7 +122,7 @@ static const struct v4l2_file_operations casio4l_fops = {
 #endif
 };
 
-static int casio4l_vidioc_querycap(struct file *file, void *priv, struct v4l2_capability *cap) {
+static int casio4l_vidioc_querycap(struct file *file, void *fh, struct v4l2_capability *cap) {
 	struct casio4l *dev = video_drvdata(file);
 	if (!dev)
 		return -ENODEV;
@@ -176,7 +176,7 @@ static int casio4l_vidioc_enum_fmt_vid_cap(struct file *file, void *fh, struct v
 	return 0;
 }
 
-static int casio4l_vidioc_g_fmt_vid_cap(struct file *file, void *priv, struct v4l2_format *fmt) {
+static int casio4l_vidioc_g_fmt_vid_cap(struct file *file, void *fh, struct v4l2_format *fmt) {
 
 	fmt->fmt.pix.width = WIDTH;
 	fmt->fmt.pix.height = HEIGHT;
@@ -510,7 +510,7 @@ static void casio4l_buf_queue(struct vb2_buffer *vb) {
 	spin_unlock_irqrestore(&dev->irqlock, flags);
 }
 
-struct vb2_ops casio4l_qops = {
+static const struct vb2_ops casio4l_qops = {
 	.queue_setup = casio4l_queue_setup,
 	.start_streaming = casio4l_start_streaming,
 	.stop_streaming = casio4l_stop_streaming,
@@ -542,7 +542,6 @@ static int casio4l_probe(struct usb_interface *intf, const struct usb_device_id 
 		break;
 	case 0x6102:
 		dev->prot = C4LP_UMS;
-		// usb_set_interface(intf->usb_dev);
 		break;
 	}
 	dev->timer.function = casio4l_timerfn;
@@ -581,7 +580,6 @@ static int casio4l_probe(struct usb_interface *intf, const struct usb_device_id 
 	vdev->ioctl_ops = &casio4l_ioctl_ops;
 	vdev->release = video_device_release_empty;
 	vdev->device_caps = V4L2_CAP_VIDEO_CAPTURE | V4L2_CAP_READWRITE | V4L2_CAP_STREAMING;
-	// vdev->dev_debug |= V4L2_DEV_DEBUG_FOP | V4L2_DEV_DEBUG_IOCTL | V4L2_DEV_DEBUG_IOCTL_ARG;
 	vdev->queue = queue;
 	video_set_drvdata(vdev, dev);
 	ret = video_register_device(vdev, VFL_TYPE_VIDEO, -1);

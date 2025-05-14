@@ -5,4 +5,7 @@ else
 KDIR ?= /lib/modules/$(shell uname -r)/build
 export KBUILD_EXTMOD := $(realpath $(dir $(lastword $(MAKEFILE_LIST))))
 include $(KDIR)/Makefile
+# for older kernels:
+# default:
+# 	$(MAKE) -C $(KDIR) M=$$PWD
 endif
